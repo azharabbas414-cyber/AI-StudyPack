@@ -102,7 +102,6 @@ def is_temporary_error(exc: Exception) -> bool:
         "rate limit",
         "too many requests",
         "temporarily",
-        "temporary_model_unavailable",
         "overloaded",
     ]
 
@@ -225,49 +224,48 @@ def generate_with_retry(
     uploaded_file=None,
     max_attempts: int = 3,
 ) -> Tuple[Dict[str, Any], str]:
-    """
-    Retry temporary failures against the same model.
-
-    Backoff:
-        ~2 sec
-        ~4 sec
-        ~8 sec
-
-    The UI also provides explicit same-model and fallback-model retry buttons.
-    """
+    """Retry temporary failures without exposing raw provider errors."""
     last_exception = None
-
     for attempt in range(1, max_attempts + 1):
         try:
-            result = call_gemini_once(
-                client=client,
-                model=model,
-                prompt=prompt,
-                uploaded_file=uploaded_file,
-            )
-            return result, model
-
+            return call_gemini_once(client, model, prompt, uploaded_file), model
         except Exception as exc:
             last_exception = exc
-
-            # Do not waste retries on authentication, invalid request,
-            # invalid model, malformed response, etc.
+            print(f"[AI DEBUG] {model} attempt {attempt}/{max_attempts}: {type(exc).__name__}: {exc}")
             if not is_temporary_error(exc):
                 raise
+            if attempt < max_attempts:
+                time.sleep((2 ** attempt) + random.uniform(0, 1))
+    raise RuntimeError("TEMPORARY_MODEL_FAILURE") from last_exception
 
-            if attempt >= max_attempts:
-                break
 
-            delay = (2 ** attempt) + random.uniform(0, 1)
-            time.sleep(delay)
+def generate_with_fallbacks(
+    client: genai.Client,
+    primary_model: str,
+    fallback_model: str,
+    prompt: str,
+    uploaded_file=None,
+    max_attempts: int = 3,
+) -> Tuple[Dict[str, Any], str]:
+    """Try the selected model, then automatically try configured alternatives."""
+    candidates = []
+    for candidate in [primary_model, fallback_model] + AVAILABLE_MODELS:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
 
-    # Keep provider details out of the exception shown to end users.
-    # The original exception is logged server-side for debugging only.
-    print(
-        f"[AI Study Pack] Model {model!r} failed after {max_attempts} "
-        f"temporary retries: {last_exception!r}"
-    )
-    raise RuntimeError("TEMPORARY_MODEL_UNAVAILABLE") from last_exception
+    last_exception = None
+    for candidate in candidates:
+        try:
+            return generate_with_retry(
+                client, candidate, prompt, uploaded_file, max_attempts
+            )
+        except Exception as exc:
+            last_exception = exc
+            print(f"[AI DEBUG] Model {candidate} unavailable/failed: {type(exc).__name__}: {exc}")
+            if not is_temporary_error(exc) and not is_model_error(exc):
+                raise
+
+    raise RuntimeError("ALL_MODELS_UNAVAILABLE") from last_exception
 
 
 # ---------------------------------------------------------------------------
@@ -650,21 +648,27 @@ def execute_generation(model: str, auto_fallback: bool = True):
     try:
         client = get_client()
 
-        with st.spinner(
-            f"Generating with `{model}`. Please wait..."
-        ):
-            result, used_model = generate_with_retry(
-                client=client,
-                model=model,
-                prompt=prompt,
-                uploaded_file=uploaded_file,
-                max_attempts=3,
-            )
+        with st.spinner("Generating your study pack and quiz... Please wait."):
+            if auto_fallback:
+                result, used_model = generate_with_fallbacks(
+                    client=client,
+                    primary_model=model,
+                    fallback_model=fallback_model,
+                    prompt=prompt,
+                    uploaded_file=uploaded_file,
+                    max_attempts=3,
+                )
+            else:
+                result, used_model = generate_with_retry(
+                    client=client,
+                    model=model,
+                    prompt=prompt,
+                    uploaded_file=uploaded_file,
+                    max_attempts=3,
+                )
 
         if "quiz" not in result:
-            raise ValueError(
-                "The AI response did not contain the required quiz."
-            )
+            raise ValueError("INVALID_AI_RESPONSE")
 
         st.session_state.study_pack = result
         st.session_state.quiz = result["quiz"]
@@ -674,23 +678,13 @@ def execute_generation(model: str, auto_fallback: bool = True):
         st.session_state.pending_request = None
         st.session_state.last_error = None
         st.session_state.last_model = used_model
-
-        st.success(f"Generated successfully using `{used_model}`.")
         st.rerun()
 
     except Exception as exc:
-        # Never expose raw provider/API exceptions in the Streamlit UI.
-        # Log the technical error to the server console instead.
-        print(f"[AI Study Pack] Generation error for model {model!r}: {exc!r}")
+        # Full provider error is visible only in the server/terminal log.
+        print(f"[AI DEBUG] Generation failed: {type(exc).__name__}: {exc}")
 
-        if is_temporary_error(exc):
-            user_error_type = "temporary"
-        elif is_model_error(exc):
-            user_error_type = "model"
-        else:
-            user_error_type = "general"
-
-        st.session_state.last_error = user_error_type
+        st.session_state.last_error = "GENERATION_FAILED"
         st.session_state.pending_request = {
             "topic": topic.strip(),
             "level": level,
@@ -703,21 +697,7 @@ def execute_generation(model: str, auto_fallback: bool = True):
             "fallback_model": fallback_model,
         }
 
-        if user_error_type == "temporary":
-            st.warning(
-                "⚠️ The AI model is temporarily busy. "
-                "Please retry the same model or try the fallback model."
-            )
-        elif user_error_type == "model":
-            st.warning(
-                "⚠️ The selected AI model is currently unavailable. "
-                "Please try the fallback model or choose another model."
-            )
-        else:
-            st.error(
-                "❌ We couldn't generate the study pack right now. "
-                "Please try again or choose another model."
-            )
+        st.error("❌ We couldn't generate the study pack right now. Please try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -733,51 +713,21 @@ if generate_button:
 # ---------------------------------------------------------------------------
 
 if st.session_state.last_error and st.session_state.pending_request:
-    error_type = st.session_state.last_error
     pending = st.session_state.pending_request
 
     st.divider()
-    st.subheader("⚠️ Gemini Generation Failed")
+    retry_col, clear_col = st.columns(2)
 
-    if error_type == "temporary":
-        st.warning(
-            "The selected Gemini model appears to be temporarily busy or "
-            "rate-limited. You can retry the same model or switch to the "
-            "fallback model."
-        )
+    with retry_col:
+        if st.button("🔄 Try Again", type="primary", use_container_width=True):
+            st.session_state.last_error = None
+            execute_generation(pending["primary_model"], auto_fallback=True)
 
-        retry1, retry2, retry3 = st.columns(3)
-
-        with retry1:
-            if st.button(
-                f"🔁 Retry Same Model\n{pending['primary_model']}",
-                use_container_width=True,
-            ):
-                st.session_state.last_error = None
-                execute_generation(pending["primary_model"])
-
-        with retry2:
-            if st.button(
-                f"🔄 Try Fallback\n{pending['fallback_model']}",
-                type="primary",
-                use_container_width=True,
-            ):
-                st.session_state.last_error = None
-                execute_generation(pending["fallback_model"])
-
-        with retry3:
-            if st.button(
-                "⚙️ Clear Error",
-                use_container_width=True,
-            ):
-                st.session_state.last_error = None
-                st.session_state.pending_request = None
-                st.rerun()
-    else:
-        st.info(
-            "This does not look like a temporary capacity error. "
-            "Check the API key, model name, request, or uploaded document."
-        )
+    with clear_col:
+        if st.button("✖ Clear", use_container_width=True):
+            st.session_state.last_error = None
+            st.session_state.pending_request = None
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
