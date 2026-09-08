@@ -102,6 +102,7 @@ def is_temporary_error(exc: Exception) -> bool:
         "rate limit",
         "too many requests",
         "temporarily",
+        "temporary_model_unavailable",
         "overloaded",
     ]
 
@@ -260,10 +261,13 @@ def generate_with_retry(
             delay = (2 ** attempt) + random.uniform(0, 1)
             time.sleep(delay)
 
-    raise RuntimeError(
-        f"Model `{model}` is temporarily unavailable after "
-        f"{max_attempts} attempts. Original error: {last_exception}"
+    # Keep provider details out of the exception shown to end users.
+    # The original exception is logged server-side for debugging only.
+    print(
+        f"[AI Study Pack] Model {model!r} failed after {max_attempts} "
+        f"temporary retries: {last_exception!r}"
     )
+    raise RuntimeError("TEMPORARY_MODEL_UNAVAILABLE") from last_exception
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +679,18 @@ def execute_generation(model: str, auto_fallback: bool = True):
         st.rerun()
 
     except Exception as exc:
-        st.session_state.last_error = str(exc)
+        # Never expose raw provider/API exceptions in the Streamlit UI.
+        # Log the technical error to the server console instead.
+        print(f"[AI Study Pack] Generation error for model {model!r}: {exc!r}")
+
+        if is_temporary_error(exc):
+            user_error_type = "temporary"
+        elif is_model_error(exc):
+            user_error_type = "model"
+        else:
+            user_error_type = "general"
+
+        st.session_state.last_error = user_error_type
         st.session_state.pending_request = {
             "topic": topic.strip(),
             "level": level,
@@ -688,7 +703,21 @@ def execute_generation(model: str, auto_fallback: bool = True):
             "fallback_model": fallback_model,
         }
 
-        st.error(f"Generation failed: {exc}")
+        if user_error_type == "temporary":
+            st.warning(
+                "⚠️ The AI model is temporarily busy. "
+                "Please retry the same model or try the fallback model."
+            )
+        elif user_error_type == "model":
+            st.warning(
+                "⚠️ The selected AI model is currently unavailable. "
+                "Please try the fallback model or choose another model."
+            )
+        else:
+            st.error(
+                "❌ We couldn't generate the study pack right now. "
+                "Please try again or choose another model."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -704,13 +733,13 @@ if generate_button:
 # ---------------------------------------------------------------------------
 
 if st.session_state.last_error and st.session_state.pending_request:
-    error = st.session_state.last_error
+    error_type = st.session_state.last_error
     pending = st.session_state.pending_request
 
     st.divider()
     st.subheader("⚠️ Gemini Generation Failed")
 
-    if is_temporary_error(Exception(error)):
+    if error_type == "temporary":
         st.warning(
             "The selected Gemini model appears to be temporarily busy or "
             "rate-limited. You can retry the same model or switch to the "
