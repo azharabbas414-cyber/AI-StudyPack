@@ -63,10 +63,12 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 
 @st.cache_data(ttl=300, show_spinner=False)
 def discover_available_models(api_key: str):
-    """Return models that the current API key can use for generateContent.
+    """Discover generation-capable Gemini models and order sensible fallbacks.
 
-    Discovery is best-effort. If listing models fails, configured models are
-    returned so generation can still be attempted.
+    We prefer models explicitly configured by the user, but if one of those
+    names is unavailable we also use real generation-capable Flash models
+    returned by the API. This avoids a hard-coded model name causing the whole
+    application to fail.
     """
     if not api_key:
         return CONFIGURED_MODELS.copy()
@@ -76,25 +78,49 @@ def discover_available_models(api_key: str):
         discovered = []
 
         for model_info in client.models.list():
-            name = getattr(model_info, "name", "") or ""
-            name = name.removeprefix("models/")
+            name = str(getattr(model_info, "name", "") or "")
+            name = name.removeprefix("models/").strip()
             actions = getattr(model_info, "supported_actions", None) or []
+            actions = [str(a) for a in actions]
 
-            if name and ("generateContent" in actions or not actions):
-                # Only generation-capable Gemini models are useful here.
-                if name.startswith("gemini-"):
-                    discovered.append(name)
+            if not name.startswith("gemini-"):
+                continue
 
-        # Only use models explicitly configured for this application.
-        # This prevents automatic fallback from unexpectedly selecting a
-        # different model that may have different pricing/availability.
-        ordered = [
-            name for name in CONFIGURED_MODELS
-            if name in discovered
+            # Some SDK versions expose supported_actions; older versions may
+            # omit it. If present, require generateContent.
+            if actions and not any("generatecontent" in a.lower() for a in actions):
+                continue
+
+            if name not in discovered:
+                discovered.append(name)
+
+        if not discovered:
+            print("[AI DEBUG] API returned no generation-capable Gemini models.")
+            return CONFIGURED_MODELS.copy()
+
+        # User-configured models get first priority when they really exist.
+        preferred = [m for m in CONFIGURED_MODELS if m in discovered]
+
+        # Prefer Flash models for this app: they are normally faster and more
+        # appropriate for repeated study-pack generation. Keep all discovered
+        # models as a final safety net.
+        flash_models = [
+            m for m in discovered
+            if "flash" in m.lower() and m not in preferred
+        ]
+        other_models = [
+            m for m in discovered
+            if m not in preferred and m not in flash_models
         ]
 
-        return ordered or CONFIGURED_MODELS.copy()
+        ordered = preferred + sorted(flash_models) + sorted(other_models)
+
+        print(f"[AI DEBUG] Available Gemini generation models: {ordered}")
+        return ordered
+
     except Exception as exc:
+        # Discovery itself must never break the app. Generation will still
+        # attempt the configured names and report only a generic UI message.
         print(f"[AI DEBUG] Model discovery failed: {type(exc).__name__}: {exc}")
         return CONFIGURED_MODELS.copy()
 
